@@ -39,6 +39,7 @@ on:
         options:
           - SukiSU
           - BakaSU
+          - FinaSU
         default: BakaSU
 
       # ==================== 可选配置 ====================
@@ -160,6 +161,8 @@ jobs:
     with:
       kernelsu_variant: ${{ inputs.kernelsu_variant }}
       ksu_commit: ${{ needs.get-manager.outputs.ksuCommit }}
+      ksu_cert_size: ${{ needs.get-manager.outputs.managerCertSize }}
+      ksu_cert_hash: ${{ needs.get-manager.outputs.managerCertHash }}
       version: ${{ inputs.version }}
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
@@ -185,6 +188,8 @@ jobs:
     with:
       kernelsu_variant: ${{ inputs.kernelsu_variant }}
       ksu_commit: ${{ needs.get-manager.outputs.ksuCommit }}
+      ksu_cert_size: ${{ needs.get-manager.outputs.managerCertSize }}
+      ksu_cert_hash: ${{ needs.get-manager.outputs.managerCertHash }}
       version: ${{ inputs.version }}
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
@@ -210,6 +215,8 @@ jobs:
     with:
       kernelsu_variant: ${{ inputs.kernelsu_variant }}
       ksu_commit: ${{ needs.get-manager.outputs.ksuCommit }}
+      ksu_cert_size: ${{ needs.get-manager.outputs.managerCertSize }}
+      ksu_cert_hash: ${{ needs.get-manager.outputs.managerCertHash }}
       version: ${{ inputs.version }}
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
@@ -235,6 +242,8 @@ jobs:
     with:
       kernelsu_variant: ${{ inputs.kernelsu_variant }}
       ksu_commit: ${{ needs.get-manager.outputs.ksuCommit }}
+      ksu_cert_size: ${{ needs.get-manager.outputs.managerCertSize }}
+      ksu_cert_hash: ${{ needs.get-manager.outputs.managerCertHash }}
       version: ${{ inputs.version }}
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
@@ -260,6 +269,8 @@ jobs:
     with:
       kernelsu_variant: ${{ inputs.kernelsu_variant }}
       ksu_commit: ${{ needs.get-manager.outputs.ksuCommit }}
+      ksu_cert_size: ${{ needs.get-manager.outputs.managerCertSize }}
+      ksu_cert_hash: ${{ needs.get-manager.outputs.managerCertHash }}
       version: ${{ inputs.version }}
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
@@ -425,11 +436,16 @@ jobs:
           case "${{ inputs.kernelsu_variant }}" in
             "SukiSU")    KSU_NAME="SukiSU" ;;
             "BakaSU")  KSU_NAME="BakaSU" ;;
+            "FinaSU")  KSU_NAME="FinaSU" ;;
           esac
           echo "KSU_NAME=$KSU_NAME" >> $GITHUB_ENV
 
-          # 版本信息
-          KSU_VER="${{ needs.get-manager.outputs.ksuVer }}"
+          # 版本信息（内核侧已对齐官方上传构建时，实际内核 KSU 版本 = managerVer，
+          # managerVer 为空（管理器拉取失败）时回退 ksuVer）
+          KSU_VER="${{ needs.get-manager.outputs.managerVer }}"
+          if [ -z "$KSU_VER" ]; then
+            KSU_VER="${{ needs.get-manager.outputs.ksuVer }}"
+          fi
           SUS_VER="${{ needs.get-manager.outputs.susVer }}"
           echo "KSU_VER=$KSU_VER" >> $GITHUB_ENV
           echo "SUS_VER=$SUS_VER" >> $GITHUB_ENV
@@ -440,18 +456,22 @@ jobs:
           echo "NET_ENHANCE_STATUS=${{ inputs.use_net_enhance && '开启' || '未开启' }}" >> $GITHUB_ENV
           echo "REKERNEL_STATUS=${{ inputs.use_rekernel && '开启' || '未开启' }}" >> $GITHUB_ENV
           if [[ "${{ inputs.use_kpm }}" == enabled* ]]; then
-            echo "KPM_STATUS=开启" >> $GITHUB_ENV
+            echo "KPM_STATUS=开启（未修补）" >> $GITHUB_ENV
           elif [[ "${{ inputs.use_kpm }}" == patched* ]]; then
-            echo "KPM_STATUS=开启（构建期修补）" >> $GITHUB_ENV
+            echo "KPM_STATUS=开启（构建时修补）" >> $GITHUB_ENV
           else
             echo "KPM_STATUS=未开启" >> $GITHUB_ENV
           fi
 
-          # Hook 类型（SukiSU / BakaSU 均为 SUSFS Inline Hooks）
+          # Hook 类型（SukiSU / BakaSU / FinaSU 的 SUSFS 集成均为 fs 内联钩子）
           echo "HOOK_TYPE=SUSFS Inline Hooks" >> $GITHUB_ENV
 
-          # Mount 类型
-          echo "MOUNT_TYPE=Magic Mount" >> $GITHUB_ENV
+          # Mount 类型（FinaSU 使用 metamodule 模块架构）
+          if [ "${{ inputs.kernelsu_variant }}" == "FinaSU" ]; then
+            echo "MOUNT_TYPE=Metamodule" >> $GITHUB_ENV
+          else
+            echo "MOUNT_TYPE=Magic Mount" >> $GITHUB_ENV
+          fi
 
           # 发布标题
           echo "RELEASE_NAME=GKI Kernel: ${KSU_NAME} ${KSU_VER} + SUSFS ${SUS_VER}" >> $GITHUB_ENV
@@ -494,6 +514,7 @@ jobs:
               fi
               ;;
             "BakaSU") BRANCH="main" ;;
+            "FinaSU") BRANCH="master" ;;
             *) echo "错误: 未知变体" >&2; exit 1 ;;
           esac
           echo "KSU_BRANCH=$BRANCH" >> $GITHUB_ENV
@@ -506,6 +527,7 @@ jobs:
           case "${{ inputs.kernelsu_variant }}" in
             "SukiSU") REPO_URL="https://github.com/SukiSU-Ultra/SukiSU-Ultra.git"; REPO_URL2="SukiSU-Ultra/SukiSU-Ultra" ;;
             "BakaSU") REPO_URL="https://github.com/Baka-SU/BakaSU.git"; REPO_URL2="Baka-SU/BakaSU" ;;
+            "FinaSU") REPO_URL="https://github.com/LyraVoid/FinaSU.git"; REPO_URL2="LyraVoid/FinaSU" ;;
           esac
 
           if [ "${{ inputs.kernelsu_variant }}" = "SukiSU" ] && [ -f "config/config" ]; then

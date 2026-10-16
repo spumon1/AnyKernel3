@@ -18,6 +18,9 @@ case "$KSU_VARIANT" in
   "SukiSU"|"BakaSU")
     echo "SukiSU/BakaSU 使用内置 SUSFS 支持"
     ;;
+  "FinaSU")
+    echo "FinaSU 使用 susfs4ksu 官方内核侧集成补丁（10_enable + drift-fixes 已在前置步骤应用）"
+    ;;
 esac
 
 cd "$KERNEL_ROOT/common"
@@ -122,6 +125,306 @@ fi
 
 patch -p1 < "$SUSFS_PATCH" || true
 
+# ==================== SukiSU builtin 新 selinux_hide 模型适配（services.c 跳板符号） ====================
+# SukiSU-Ultra builtin 2026-05-29 (5fb0c079) 同步 tiann/KernelSU 的 SELinux 新检测
+# 修复后，feature/selinux_hide.c 在 >=6.6 分支把 security_dump_masked_av_fn /
+# context_struct_compute_av_fn 声明为 extern 函数——上游预期由 services.c 补丁提供
+# 这两个跳板符号（builtin c32094a4 提交说明），但 SUSFS 主补丁只在 services.c 提供
+# my_security_compute_av_user，不含这两个符号，导致 6.6/6.12 全部 SUSFS 构建在
+# vmlinux 链接阶段报：
+#   ld.lld: error: undefined symbol: context_struct_compute_av_fn
+# 在 services.c 末尾补上两个跳板（对同名 static 函数的薄封装，与上游预期形态一致）；
+# 仅当检测到 builtin 的 extern 引用且 services.c 尚无跳板时追加，
+# 上游自行提供后按内容检测自动跳过，幂等。
+KSU_HIDE_FILE="$KERNEL_ROOT/KernelSU/kernel/feature/selinux_hide.c"
+SEC_SERVICES="security/selinux/ss/services.c"
+if [ -f "$KSU_HIDE_FILE" ] && grep -q 'extern void context_struct_compute_av_fn' "$KSU_HIDE_FILE" \
+  && [ -f "$SEC_SERVICES" ] && ! grep -q 'void context_struct_compute_av_fn(' "$SEC_SERVICES"; then
+  if ! grep -q 'static void context_struct_compute_av(' "$SEC_SERVICES"; then
+    echo "::error::services.c 缺少 static context_struct_compute_av，无法生成 SukiSU 跳板符号"
+    exit 1
+  fi
+  echo "补齐 SukiSU builtin selinux_hide 所需的 services.c 跳板符号..."
+  python3 - "$SEC_SERVICES" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+src = open(path, encoding="utf-8", errors="surrogateescape").read()
+if "void context_struct_compute_av_fn(" in src:
+    sys.exit(0)
+tramp = (
+    "\n"
+    "/* Trampolines for SukiSU-Ultra builtin selinux_hide (KSU_SUSFS builds):\n"
+    " * kernel/feature/selinux_hide.c (>=6.6 model) declares *_fn as extern;\n"
+    " * provide thin wrappers around the static implementations here. */\n"
+    "#ifdef CONFIG_KSU_SUSFS\n"
+    "void context_struct_compute_av_fn(struct policydb *policydb,\n"
+    "\t\t\t\t  struct context *scontext,\n"
+    "\t\t\t\t  struct context *tcontext,\n"
+    "\t\t\t\t  u16 tclass,\n"
+    "\t\t\t\t  struct av_decision *avd,\n"
+    "\t\t\t\t  struct extended_perms *xperms);\n"
+    "void context_struct_compute_av_fn(struct policydb *policydb,\n"
+    "\t\t\t\t  struct context *scontext,\n"
+    "\t\t\t\t  struct context *tcontext,\n"
+    "\t\t\t\t  u16 tclass,\n"
+    "\t\t\t\t  struct av_decision *avd,\n"
+    "\t\t\t\t  struct extended_perms *xperms)\n"
+    "{\n"
+    "\tcontext_struct_compute_av(policydb, scontext, tcontext, tclass, avd, xperms);\n"
+    "}\n"
+)
+if "static void security_dump_masked_av(" in src:
+    tramp += (
+        "\n"
+        "void security_dump_masked_av_fn(struct policydb *policydb,\n"
+        "\t\t\t\tstruct context *scontext,\n"
+        "\t\t\t\tstruct context *tcontext,\n"
+        "\t\t\t\tu16 tclass,\n"
+        "\t\t\t\tu32 permissions,\n"
+        "\t\t\t\tconst char *reason);\n"
+        "void security_dump_masked_av_fn(struct policydb *policydb,\n"
+        "\t\t\t\tstruct context *scontext,\n"
+        "\t\t\t\tstruct context *tcontext,\n"
+        "\t\t\t\tu16 tclass,\n"
+        "\t\t\t\tu32 permissions,\n"
+        "\t\t\t\tconst char *reason)\n"
+        "{\n"
+        "\tsecurity_dump_masked_av(policydb, scontext, tcontext, tclass, permissions, reason);\n"
+        "}\n"
+    )
+else:
+    print("::warning::services.c 缺少 static security_dump_masked_av，跳过对应跳板")
+tramp += "#endif /* CONFIG_KSU_SUSFS */\n"
+open(path, "w", encoding="utf-8", errors="surrogateescape").write(src + tramp)
+print("%s: appended *_fn trampolines" % path)
+PYEOF
+  grep -q 'void context_struct_compute_av_fn(' "$SEC_SERVICES" \
+    || { echo "::error::services.c 跳板符号追加后校验失败"; exit 1; }
+  echo "services.c: 已提供 context_struct_compute_av_fn / security_dump_masked_av_fn"
+fi
+
+# ==================== FinaSU 新 selinux_hide 模型适配 ====================
+# 自 FinaSU v0.1.0-preview1 起，kernel/feature/selinux_hide.c 换成了 tiann 新形态：
+#   移除 fake_state；统一用 backup_sepolicy + security_context_to_sid_with_policy(..., &orig_sid_p, &orig_rc_p)（8 参）；
+#   且该函数内部已做“双策略 + 全局 sidtab 同步”（KernelSU #3877/#3873）。
+# 此形态下把 SUSFS 主补丁 <6.6 的 SELinux 代码也从 &fake_state 切到 backup_sepolicy + 8 参 _with_policy，
+# 并补上权限检查顺序（df03912f）；sidtab 同步由上游 _with_policy 内置，无需外部再移植。
+NEW_MODEL=0
+FINASU_SELINUX_HIDE="$KERNEL_ROOT/KernelSU/kernel/feature/selinux_hide.c"
+if [ -f "$FINASU_SELINUX_HIDE" ] && ! grep -q 'fake_state' "$FINASU_SELINUX_HIDE"; then
+  NEW_MODEL=1
+fi
+# 触发条件：
+#   >=6.6 主补丁在 selinuxfs.c 里定义 my_write_context（新式）
+#   <6.6（5.15/6.1）主补丁直接改 sel_write_context/sel_write_access，用 &fake_state（旧式）
+# 两者都要从 fake_state 切到 backup_sepolicy + 8 参 _with_policy，否则新形态 FinaSU 无
+# fake_state 定义会导致 ThinLTO 链接报 undefined symbol: fake_state。
+if [ "$NEW_MODEL" = 1 ] && [ -f security/selinux/selinuxfs.c ] \
+  && { grep -q 'static ssize_t my_write_context' security/selinux/selinuxfs.c \
+       || grep -q '&fake_state' security/selinux/selinuxfs.c; }; then
+  echo "检测到 FinaSU 新 selinux_hide 形态：SUSFS <6.6 的 SELinux 代码切换到 backup_sepolicy + 8 参 _with_policy"
+  python3 - <<'PYEOF'
+import re as _re, sys as _sys
+
+NEW_FS_EXTERNS = (
+    "extern struct selinux_policy *backup_sepolicy;\n"
+    "extern int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p);\n"
+    "extern int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext, u32 *scontext_len);\n"
+    "extern void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);\n"
+)
+NEW_HK_EXTERNS = (
+    "extern struct selinux_policy *backup_sepolicy;\n"
+    "extern int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p);\n"
+)
+
+def _sub(path, name, old, new):
+    s = open(path, encoding="utf-8", errors="surrogateescape").read()
+    n = s.count(old)
+    if n != 1:
+        print("::warning::%s: %s count=%d (expect 1)" % (path, name, n))
+        return
+    open(path, "w", encoding="utf-8", errors="surrogateescape").write(s.replace(old, new, 1))
+    print("%s: %s OK" % (path, name))
+
+fs = "security/selinux/selinuxfs.c"
+_sub(fs, "extern", "extern struct selinux_state fake_state;\n", NEW_FS_EXTERNS)
+_sub(fs, "ctx", "security_context_to_sid(&fake_state, buf, size, &sid, GFP_KERNEL)",
+     "security_context_to_sid_with_policy(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)")
+_sub(fs, "sid2ctx", "security_sid_to_context(&fake_state, sid, &canon, &len)",
+     "security_sid_to_context_with_policy(backup_sepolicy, sid, &canon, &len)")
+_sub(fs, "scon", "security_context_str_to_sid(&fake_state, scon, &ssid, GFP_KERNEL)",
+     "security_context_to_sid_with_policy(backup_sepolicy, scon, strlen(scon), &ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL)")
+_sub(fs, "tcon", "security_context_str_to_sid(&fake_state, tcon, &tsid, GFP_KERNEL)",
+     "security_context_to_sid_with_policy(backup_sepolicy, tcon, strlen(tcon), &tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL)")
+_sub(fs, "av", "security_compute_av_user(&fake_state, ssid, tsid, tclass, &avd)",
+     "security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd)")
+
+hk = "security/selinux/hooks.c"
+_sub(hk, "extern", "extern struct selinux_state fake_state;\n", NEW_HK_EXTERNS)
+
+# <6.6 形态：resolve(&fake_state, value) -> _with_policy(8 参)
+#   6.1 主补丁为多行 &sid；5.15 主补丁为单行 &tmp_sid。两种都归一化。
+_hs = open(hk, encoding="utf-8", errors="surrogateescape").read()
+_hs, _n = _re.subn(r"security_context_to_sid\(&fake_state, value, size,\s*\n\s*&sid, GFP_KERNEL\)",
+                   "security_context_to_sid_with_policy(backup_sepolicy, value, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)", _hs)
+_hs, _n15 = _re.subn(r"security_context_to_sid\(&fake_state, value, size, &tmp_sid, GFP_KERNEL\)",
+                     "security_context_to_sid_with_policy(backup_sepolicy, value, size, &tmp_sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)", _hs)
+print("%s: setprocattr.ctx <6.6=%d/%d" % (hk, _n, _n15))
+open(hk, "w", encoding="utf-8", errors="surrogateescape").write(_hs)
+
+# >=6.6 形态：把已有的 6 参 _with_policy 声明/调用补成 8 参（新模型签名）
+#   6.6 主补丁在 security/selinux/{hooks,selinuxfs}.c 里自带 6 参 extern 声明，
+#   只把调用补成 8 参会报 "too many arguments to function call, expected 6, have 8"。
+#   因此 extern 声明必须与调用一起改成 8 参（新 FinaSU 的定义是 8 参）。
+for _lab, _f in (("selinuxfs", fs), ("hooks", hk)):
+    _s = open(_f, encoding="utf-8", errors="surrogateescape").read()
+    # (?!, NULL, NULL) 保证幂等：<6.6 已由上文 _sub 切成 8 参的调用不再重复追加
+    _s, _n2 = _re.subn(r"(security_context_to_sid_with_policy\(backup_sepolicy,[^;]*?, GFP_KERNEL)\)(?!, NULL, NULL)", r"\1, NULL, NULL)", _s)
+    _s, _nd = _re.subn(r"(security_context_to_sid_with_policy\(struct selinux_policy \*policy, const char \*scontext, u32 scontext_len,\s*\n\s*u32 \*sid, u32 def_sid, gfp_t gfp_flags)\);", r"\1, u32 *orig_sid_p, int *orig_rc_p);", _s)
+    open(_f, "w", encoding="utf-8", errors="surrogateescape").write(_s)
+    print("%s: _with_policy 8-arg normalize=%d decl=%d" % (_lab, _n2, _nd))
+
+_hs = open(hk, encoding="utf-8", errors="surrogateescape").read()
+# 去掉无条件 SETCURRENT 检查（df03912f）：覆盖 <6.6(&selinux_state) 与 >=6.6(无 state) 两种形态
+_removed = False
+for _rm in ("\terror = avc_has_perm(&selinux_state,\n\t\t\t\t     mysid, mysid, SECCLASS_PROCESS,\n\t\t\t\t     PROCESS__SETCURRENT, NULL);\n\n\tif (error)\n\t\treturn error;\n\n",
+            "\terror = avc_has_perm(mysid, mysid, SECCLASS_PROCESS,\n\t\t\t\t     PROCESS__SETCURRENT, NULL);\n\n\tif (error)\n\t\treturn error;\n\n"):
+    if _hs.count(_rm) == 1:
+        _hs = _hs.replace(_rm, "", 1)
+        _removed = True
+        print("%s: rm_early_setcurrent OK" % hk)
+        break
+if not _removed:
+    print("::warning::%s: rm_early_setcurrent not matched" % hk)
+# 仅在 backup 解析失败时才检查 SETCURRENT
+_seq_done = False
+for _old2, _new2, _lab in (
+    ("\t\terror = security_context_to_sid_with_policy(backup_sepolicy, value, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);\n\t\tif (error)\n\t\t\treturn error;\n",
+     "\t\terror = security_context_to_sid_with_policy(backup_sepolicy, value, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);\n\t\tif (error) {\n\t\t\tint perm_error = avc_has_perm(&selinux_state, mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);\n\t\t\treturn perm_error ?: error;\n\t\t}\n", "<6.6"),
+    ("\t\terror = security_context_to_sid_with_policy(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);\n\t\tif (error)\n\t\t\treturn error;\n",
+     "\t\terror = security_context_to_sid_with_policy(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);\n\t\tif (error) {\n\t\t\tint perm_error = avc_has_perm(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);\n\t\t\treturn perm_error ?: error;\n\t\t}\n", ">=6.6")):
+    if _hs.count(_old2) == 1:
+        _hs = _hs.replace(_old2, _new2, 1)
+        _seq_done = True
+        print("%s: seq(%s) OK" % (hk, _lab))
+        break
+if not _seq_done:
+    print("::warning::%s: seq not matched" % hk)
+open(hk, "w", encoding="utf-8", errors="surrogateescape").write(_hs)
+for _f in (fs, hk):
+    _s = open(_f, encoding="utf-8", errors="surrogateescape").read()
+    if "fake_state" in _s:
+        _sys.stderr.write("::error::%s 仍有 fake_state 残留\n" % _f)
+        _sys.exit(1)
+PYEOF
+  # 仅作信息输出；5.15 主补丁不含 perm_error（权限顺序重排只适配 my_write_context 形态），
+  # 这里 grep 可能无命中，必须 || true，否则 set -e 会中断整个补丁步骤。
+  grep -n 'backup_sepolicy' security/selinux/selinuxfs.c | head -3 || true
+  grep -n 'perm_error' security/selinux/hooks.c | head -3 || true
+fi
+
+# ==================== 移植 KernelSU 的 SELinux 隐藏侧信道修复（旧 fake_state 形态）====================
+# 检测方把 /sys/fs/selinux/{context,access} 与 setprocattr 当 oracle：比对
+# 假策略(fake_state)与全局 selinux_state 的 SID、以及权限检查顺序，来识别隐藏。
+# SUSFS 主补丁实现的 my_write_context / my_write_access / my_setprocattr 缺这两点，
+# 这里按 KernelSU 的做法补齐：
+#   - sidtab 同步（KernelSU #3873）：用假策略解析后再同步进全局 sidtab，消除 SID 差异；
+#   - 权限检查顺序（KernelSU df03912f）：仅当 backup 解析失败时才做 SETCURRENT 检查。
+if [ "${NEW_MODEL:-0}" != 1 ] && [ -f security/selinux/selinuxfs.c ] && grep -q 'static ssize_t my_write_context' security/selinux/selinuxfs.c \
+  && [ -f security/selinux/hooks.c ] && grep -q 'static int my_setprocattr' security/selinux/hooks.c; then
+  python3 - <<'PYEOF'
+import re
+
+def sed(path, name, pat, repl):
+    src = open(path, encoding="utf-8", errors="surrogateescape").read()
+    new, n = re.subn(pat, repl, src, count=1)
+    if n == 0:
+        print("::warning::%s: %s not matched (skip)" % (path, name))
+        return
+    open(path, "w", encoding="utf-8", errors="surrogateescape").write(new)
+    print("%s: %s OK" % (path, name))
+
+fs = "security/selinux/selinuxfs.c"
+# my_write_context（<6.6 用 fake_state；>=6.6 用 backup_sepolicy 的 _with_policy 解析）
+sed(fs, "ctx(<6.6)", r"(\tlength = security_context_to_sid\(&fake_state, buf, size, &sid, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_to_sid(&selinux_state, buf, size, &tmp_sid, GFP_KERNEL);\n\t}\n")
+sed(fs, "ctx(>=6.6)", r"(\tlength = security_context_to_sid_with_policy\(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_to_sid(buf, size, &tmp_sid, GFP_KERNEL);\n\t}\n")
+# my_write_access scon / tcon
+sed(fs, "scon(<6.6)", r"(\tlength = security_context_str_to_sid\(&fake_state, scon, &ssid, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_str_to_sid(&selinux_state, scon, &tmp_sid, GFP_KERNEL);\n\t}\n")
+sed(fs, "scon(>=6.6)", r"(\tlength = security_context_to_sid_with_policy\(backup_sepolicy, scon, strlen\(scon\), &ssid, SECSID_NULL, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_to_sid(scon, strlen(scon), &tmp_sid, GFP_KERNEL);\n\t}\n")
+sed(fs, "tcon(<6.6)", r"(\tlength = security_context_str_to_sid\(&fake_state, tcon, &tsid, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_str_to_sid(&selinux_state, tcon, &tmp_sid, GFP_KERNEL);\n\t}\n")
+sed(fs, "tcon(>=6.6)", r"(\tlength = security_context_to_sid_with_policy\(backup_sepolicy, tcon, strlen\(tcon\), &tsid, SECSID_NULL, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_to_sid(tcon, strlen(tcon), &tmp_sid, GFP_KERNEL);\n\t}\n")
+
+hk = "security/selinux/hooks.c"
+# 去掉无条件 SETCURRENT 检查（<6.6 带 &selinux_state；>=6.6 不带）
+sed(hk, "rm_early(<6.6)", r"\terror = avc_has_perm\(&selinux_state,\n\t\t\t\t     mysid, mysid, SECCLASS_PROCESS,\n\t\t\t\t     PROCESS__SETCURRENT, NULL\);\n\n\tif \(error\)\n\t\treturn error;\n\n", "")
+sed(hk, "rm_early(>=6.6)", r"\terror = avc_has_perm\(mysid, mysid, SECCLASS_PROCESS,\n\t\t\t\t     PROCESS__SETCURRENT, NULL\);\n\n\tif \(error\)\n\t\treturn error;\n\n", "")
+# 仅在 backup 解析失败时才检查 SETCURRENT，并同步全局 sidtab
+sed(hk, "seq+sync(<6.6)", r"(\t\terror = security_context_to_sid\(&fake_state, value, size,\n\t\t\t\t\t\t&sid, GFP_KERNEL\);\n)\t\tif \(error\)\n\t\t\treturn error;\n",
+    "\\1\t\tif (error) {\n\t\t\t/* FINASU_SEQ: 仅当 backup 解析失败时才做 SETCURRENT 检查（KernelSU df03912f） */\n\t\t\tint perm_error = avc_has_perm(&selinux_state, mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);\n\t\t\treturn perm_error ?: error;\n\t\t}\n\t\t{\n\t\t\tu32 tmp_sid;\n\t\t\t/* FINASU_SIDTAB_SYNC (KernelSU #3873) */\n\t\t\tsecurity_context_to_sid(&selinux_state, value, size, &tmp_sid, GFP_KERNEL);\n\t\t}\n")
+sed(hk, "seq+sync(>=6.6)", r"(\t\terror = security_context_to_sid_with_policy\(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL\);\n)\t\tif \(error\)\n\t\t\treturn error;\n",
+    "\\1\t\tif (error) {\n\t\t\t/* FINASU_SEQ: 仅当 backup 解析失败时才做 SETCURRENT 检查（KernelSU df03912f） */\n\t\t\tint perm_error = avc_has_perm(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);\n\t\t\treturn perm_error ?: error;\n\t\t}\n\t\t{\n\t\t\tu32 tmp_sid;\n\t\t\t/* FINASU_SIDTAB_SYNC (KernelSU #3873) */\n\t\t\tsecurity_context_to_sid(str, size, &tmp_sid, GFP_KERNEL);\n\t\t}\n")
+PYEOF
+  grep -n 'FINASU_SIDTAB_SYNC' security/selinux/selinuxfs.c | head
+  grep -n 'FINASU_SIDTAB_SYNC\|FINASU_SEQ' security/selinux/hooks.c | head
+else
+  echo "::warning::未找到 SUSFS 的 my_write_context/my_setprocattr，跳过 SELinux 侧信道移植"
+fi
+
+# ==================== SUSFS 路径隐藏回退（跨命名空间 / FUSE） ====================
+# susfs_add_sus_path（非 loop）在“调用方命名空间”里 kern_path 解析路径；管理器/ksud 常解析不到
+# /storage/emulated 这类 FUSE 路径（-ENOENT），于是规则加不进去、路径隐藏失效。
+# 这里加回退：解析失败时自动改走 LOOP 机制（内核 workqueue 在 init 命名空间稍后解析并打标记）。
+if [ -f fs/susfs.c ] && grep -qF 'void susfs_add_sus_path(void __user **user_info)' fs/susfs.c \
+  && ! grep -qF 'FINASU_SUS_PATH_LOOP_FALLBACK' fs/susfs.c; then
+  python3 - <<'PYEOF'
+p = "fs/susfs.c"
+s = open(p, encoding="utf-8", errors="surrogateescape").read()
+old1 = "void susfs_add_sus_path(void __user **user_info) {"
+new1 = "void susfs_add_sus_path_loop(void __user **user_info);\n" + old1
+if s.count(old1) != 1:
+    print("::warning::fs/susfs.c: susfs_add_sus_path 签名不是预期形态，跳过")
+else:
+    s = s.replace(old1, new1, 1)
+    old2 = ("\tif (copy_from_user(&info, (struct st_susfs_sus_path __user*)*user_info, sizeof(info))) {\n"
+            "\t\tinfo.err = -EFAULT;\n"
+            "\t\tgoto out_copy_to_user;\n"
+            "\t}\n\n"
+            "\tinfo.err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);\n"
+            "\tif (info.err) {\n"
+            "\t\tSUSFS_LOGE(\"failed opening file '%s'\\n\", info.target_pathname);\n"
+            "\t\tgoto out_copy_to_user;\n"
+            "\t}\n")
+    new2 = ("\tif (copy_from_user(&info, (struct st_susfs_sus_path __user*)*user_info, sizeof(info))) {\n"
+            "\t\tinfo.err = -EFAULT;\n"
+            "\t\tgoto out_copy_to_user;\n"
+            "\t}\n\n"
+            "\tinfo.err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);\n"
+            "\tif (info.err) {\n"
+            "\t\tSUSFS_LOGE(\"failed opening '%s' in current ns, fallback to sus_path_loop\\n\", info.target_pathname);\n"
+            "\t\t/* FINASU_SUS_PATH_LOOP_FALLBACK: 调用方命名空间解析不到（常见于 /storage/emulated 等 FUSE 路径）时，\n"
+            "\t\t   退回 LOOP 机制，交由内核 workqueue 在 init 命名空间稍后解析并重新打标记 */\n"
+            "\t\tsusfs_add_sus_path_loop(user_info);\n"
+            "\t\treturn;\n"
+            "\t}\n")
+    if s.count(old2) != 1:
+        print("::warning::fs/susfs.c: susfs_add_sus_path 代码形态不是预期，跳过回退")
+    else:
+        open(p, "w", encoding="utf-8", errors="surrogateescape").write(s.replace(old2, new2, 1))
+        print("fs/susfs.c: 已加 SUSFS 路径隐藏 LOOP 回退")
+PYEOF
+  grep -n 'FINASU_SUS_PATH_LOOP_FALLBACK' fs/susfs.c | head
+else
+  echo "::warning::未找到 fs/susfs.c 的 susfs_add_sus_path，跳过路径隐藏回退"
+fi
+
+
 # ---- 预期冲突处理：上游已包含同款修改的 .rej 剔除，真实缺失的手工补齐 ----
 
 # 1) fs/unicode：ASB 内核已包含上游 "unicode: don't special case ignorable code
@@ -155,7 +458,7 @@ fi
 
 # 为尚未提供 SU 会话 FD 接口的 SukiSU/BakaSU 恢复旧版 exec hook 行为
 EXEC_HELPER=""
-if [[ "$KSU_VARIANT" == SukiSU* || "$KSU_VARIANT" == "BakaSU" ]]; then
+if [[ "$KSU_VARIANT" == SukiSU* || "$KSU_VARIANT" == "BakaSU" || "$KSU_VARIANT" == "FinaSU" ]]; then
   if grep -qF 'ksu_install_su_fd();' fs/exec.c; then
     EXEC_HELPER="ksu_install_su_fd"
   elif grep -qF 'ksu_handle_post_execveat_sucompat(' fs/exec.c; then
@@ -181,13 +484,17 @@ fi
 # 上游 5.10 主补丁把 susfs_sus_kstat_spoof_vfs_statfs 的 extern 声明放在了
 # fs/statfs.c 的使用点之后（vfs_statfs 之前），clang -Werror 报隐式声明；
 # 声明属于 SUSFS 接口，直接补进公共头 include/linux/susfs_def.h：
-# 不依赖 statfs.c 内锚点与行号比较，声明重复合法，上游后续自行修复也不冲突
+# 不依赖 statfs.c 内锚点与行号比较，声明重复合法，上游后续自行修复也不冲突。
+# 注意：FinaSU 的 setuid_hook.c / sucompat.c 会在仅有 <linux/types.h> 等基础
+# 头文件时就包含 susfs_def.h，此时 struct kstatfs 尚未声明，原型内引入新
+# struct 标签会触发 clang -Werror,-Wvisibility（上游内核构建日志实证），
+# 因此必须连同 struct 前置声明一起插入。
 SUSFS_DEF_H="$KERNEL_ROOT/common/include/linux/susfs_def.h"
 if [[ -f fs/statfs.c ]] && grep -qF 'susfs_sus_kstat_spoof_vfs_statfs(' fs/statfs.c \
   && [[ -f "$SUSFS_DEF_H" ]] \
   && ! grep -qF 'susfs_sus_kstat_spoof_vfs_statfs(' "$SUSFS_DEF_H"; then
   echo "将 susfs_sus_kstat_spoof_vfs_statfs 声明补入 include/linux/susfs_def.h"
-  sed -i '/^#endif \/\/ #ifndef KSU_SUSFS_DEF_H$/i extern int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, bool *is_fuse);' "$SUSFS_DEF_H"
+  sed -i '/^#endif \/\/ #ifndef KSU_SUSFS_DEF_H$/i struct inode;\nstruct kstatfs;\nextern int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, bool *is_fuse);' "$SUSFS_DEF_H"
 fi
 
 # 上游 susfs.c 直接调用 security_sb_statfs 却没有包含 linux/security.h，

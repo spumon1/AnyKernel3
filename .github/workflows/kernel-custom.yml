@@ -63,7 +63,7 @@ on:
           - "237 (2025-06)"
           - "240 (2025-09)"
           - "246 (2025-12)"
-          - "lts (5.10.269)"
+          - "lts (5.10.270)"
       sub_level_5_15:
         description: "5.15 子版本 (选择后自动匹配安全补丁级别；仅内核版本为 5.15 时生效)"
         required: false
@@ -187,7 +187,7 @@ on:
           - "69 (2026-03)"
           - "81 (2026-06)"
           - "92 (2026-09)"
-          - "lts (6.12.94)"
+          - "lts (6.12.96)"
 
       # ==================== KernelSU 配置 ====================
       kernelsu_variant:
@@ -197,6 +197,7 @@ on:
         options:
           - SukiSU
           - BakaSU
+          - FinaSU
         default: BakaSU
 
       # ==================== 可选配置 ====================
@@ -404,8 +405,10 @@ jobs:
       revision: "r1"
       ksu_variant: ${{ inputs.kernelsu_variant }}
       # 内核侧 KernelSU 检出到官方最新上传 Manager 构建的同一提交，
-      # 使内核 KSU 版本与拉取的管理器安装包严格一致（BakaSU 生效）
+      # 使内核 KSU 版本与拉取的管理器安装包严格一致（BakaSU / FinaSU 生效）
       ksu_commit: ${{ needs.get-ksu-manager.outputs.ksuCommit }}
+      ksu_cert_size: ${{ needs.get-ksu-manager.outputs.managerCertSize }}
+      ksu_cert_hash: ${{ needs.get-ksu-manager.outputs.managerCertHash }}
       version: ${{ inputs.version || '' }}
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
